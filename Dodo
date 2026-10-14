@@ -1,0 +1,170 @@
+-- =================================================
+-- KOMAT Dumper : ดึง Remote / รายชื่อท่า / โครงสร้างผู้เล่น  แล้วเซฟเป็นไฟล์
+-- วิธีใช้: รันในเกม Evade -> ทำอีโมท, อุ้มคน, ชุบคน, ล้ม ฯลฯ ให้ครบ -> กดปุ่ม "บันทึกไฟล์"
+-- ไฟล์: KOMAT_Evade_Dump.txt (อยู่ในโฟลเดอร์ workspace ของ executor)
+-- =================================================
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local OUT = "KOMAT_Evade_Dump.txt"
+
+local out = {}
+local function w(s) out[#out + 1] = tostring(s) end
+
+local function path(i)
+	local ok, r = pcall(function() return i:GetFullName() end)
+	return ok and r or tostring(i)
+end
+
+-- ---------- serialize ----------
+local function ser(v, d)
+	d = d or 0
+	local t = typeof(v)
+	if t == "string" then return string.format("%q", v)
+	elseif t == "buffer" then
+		local n = buffer.len(v)
+		local h = {}
+		for i = 0, math.min(n, 64) - 1 do h[#h + 1] = string.format("%02X", buffer.readu8(v, i)) end
+		return ("buffer(%d)[%s]"):format(n, table.concat(h, " "))
+	elseif t == "table" then
+		if d > 3 then return "{...}" end
+		local p, c = {}, 0
+		for k, x in pairs(v) do
+			c += 1
+			if c > 20 then p[#p + 1] = "..." break end
+			p[#p + 1] = "[" .. ser(k, d + 1) .. "]=" .. ser(x, d + 1)
+		end
+		return "{" .. table.concat(p, ", ") .. "}"
+	elseif t == "Instance" then return "Instance<" .. path(v) .. ">"
+	else return tostring(v) end
+end
+
+local function treeDump(root, maxDepth, depth, indent)
+	depth = depth or 0
+	indent = indent or ""
+	w(indent .. root.Name .. " [" .. root.ClassName .. "]")
+	local ok, attrs = pcall(function() return root:GetAttributes() end)
+	if ok then
+		for k, v in pairs(attrs) do w(indent .. "  @" .. k .. " = " .. ser(v)) end
+	end
+	if root:IsA("ValueBase") then w(indent .. "  value = " .. ser(root.Value)) end
+	if depth < maxDepth then
+		for _, c in ipairs(root:GetChildren()) do treeDump(c, maxDepth, depth + 1, indent .. "  ") end
+	end
+end
+
+-- ---------- 1) Remote ทั้งหมดใน ReplicatedStorage ----------
+w("## REMOTES (ReplicatedStorage)")
+for _, i in ipairs(RS:GetDescendants()) do
+	if i:IsA("RemoteEvent") or i:IsA("RemoteFunction") or i:IsA("UnreliableRemoteEvent") then
+		w(("[%s] %s"):format(i.ClassName, path(i)))
+	end
+end
+
+-- ---------- 2) ท่าเต้น : ทุกอย่างที่ชื่อมี emote ----------
+w("\n## EMOTE-RELATED INSTANCES")
+local emoteFolders = {}
+for _, i in ipairs(RS:GetDescendants()) do
+	if i.Name:lower():find("emote") then
+		w(("[%s] %s  (children=%d)"):format(i.ClassName, path(i), #i:GetChildren()))
+		if #i:GetChildren() > 0 then emoteFolders[#emoteFolders + 1] = i end
+	end
+end
+w("\n## EMOTE NAMES (ลูกของโฟลเดอร์ที่เจอ)")
+for _, f in ipairs(emoteFolders) do
+	w("-- " .. path(f))
+	for _, c in ipairs(f:GetChildren()) do w("  " .. c.Name .. " [" .. c.ClassName .. "]") end
+end
+w("\n## EMOTE MODULES (require)")
+for _, i in ipairs(RS:GetDescendants()) do
+	if i:IsA("ModuleScript") and i.Name:lower():find("emote") then
+		local ok, r = pcall(require, i)
+		w(("%s -> %s"):format(path(i), ok and ser(r) or "require ไม่ได้"))
+	end
+end
+
+-- ---------- 3) โครงสร้างผู้เล่น / state ล้ม ----------
+w("\n## workspace.Game (depth 3)")
+if workspace:FindFirstChild("Game") then treeDump(workspace.Game, 3) end
+w("\n## LOCAL CHARACTER")
+if player.Character then treeDump(player.Character, 1) end
+w("\n## LOCAL PLAYER ATTRIBUTES / PlayerGui names")
+for k, v in pairs(player:GetAttributes()) do w("@" .. k .. " = " .. ser(v)) end
+for _, g in ipairs(player.PlayerGui:GetChildren()) do w("gui: " .. g.Name) end
+
+-- ---------- 4) Remote Spy (จับตอนคุณทำ อุ้ม/ชุบ/อีโมท) ----------
+local spy, counts = {}, {}
+local function logCall(kind, remote, ...)
+	local key = kind .. path(remote)
+	counts[key] = (counts[key] or 0) + 1
+	if counts[key] <= 6 then -- เก็บตัวอย่าง 6 ครั้งแรกต่อ remote กันไฟล์บวม
+		local a = table.pack(...)
+		local p = {}
+		for n = 1, a.n do p[#p + 1] = ser(a[n]) end
+		spy[#spy + 1] = ("[%s #%d] %s\n    args: %s"):format(kind, counts[key], path(remote), table.concat(p, ", "))
+	end
+end
+
+local hooked = pcall(function()
+	local old
+	old = hookmetamethod(game, "__namecall", function(self, ...)
+		local m = getnamecallmethod()
+		if (m == "FireServer" or m == "InvokeServer") and typeof(self) == "Instance" then
+			pcall(logCall, m, self, ...)
+		end
+		return old(self, ...)
+	end)
+end)
+
+-- จับ event ฝั่ง server -> client ด้วย (เช่น PassCharacterInfo)
+for _, i in ipairs(RS:GetDescendants()) do
+	if i:IsA("RemoteEvent") then
+		pcall(function()
+			i.OnClientEvent:Connect(function(...) logCall("OnClientEvent", i, ...) end)
+		end)
+	end
+end
+
+-- ---------- 5) UI ปุ่มบันทึก ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "KomatDumper"
+gui.ResetOnSpawn = false
+gui.Parent = player.PlayerGui
+local btn = Instance.new("TextButton", gui)
+btn.Size = UDim2.fromOffset(200, 48)
+btn.Position = UDim2.fromScale(0.5, 0.05)
+btn.AnchorPoint = Vector2.new(0.5, 0)
+btn.Text = "💾 บันทึกไฟล์"
+btn.Font = Enum.Font.GothamBold
+btn.TextScaled = true
+btn.TextColor3 = Color3.new(1, 1, 1)
+btn.BackgroundColor3 = Color3.fromRGB(0, 140, 255)
+btn.Active = true
+btn.Draggable = true
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 12)
+
+local function save()
+	local body = table.concat(out, "\n")
+		.. "\n\n## REMOTE SPY (hook " .. (hooked and "ทำงาน" or "ไม่ทำงาน") .. ")\n"
+		.. table.concat(spy, "\n")
+		.. "\n\n## CALL COUNTS\n"
+	local ks = {}
+	for k, c in pairs(counts) do ks[#ks + 1] = ("%6d  %s"):format(c, k) end
+	table.sort(ks, function(a, b) return a > b end)
+	body ..= table.concat(ks, "\n")
+	-- รีเฟรชข้อมูล character ล่าสุด (ตอนล้ม attribute จะเปลี่ยน)
+	if player.Character then
+		local snap = {"\n\n## LOCAL CHARACTER (ตอนกดบันทึก)"}
+		for k, v in pairs(player.Character:GetAttributes()) do snap[#snap + 1] = "@" .. k .. " = " .. ser(v) end
+		local pf = workspace:FindFirstChild("Game") and workspace.Game:FindFirstChild("Players")
+		pf = pf and pf:FindFirstChild(player.Name)
+		if pf then for k, v in pairs(pf:GetAttributes()) do snap[#snap + 1] = "PlayerFolder @" .. k .. " = " .. ser(v) end end
+		body ..= table.concat(snap, "\n")
+	end
+	local ok, err = pcall(writefile, OUT, body)
+	btn.Text = ok and "✅ เซฟแล้ว" or "❌ writefile ไม่ได้"
+	if not ok then warn(err) end
+	task.delay(2, function() btn.Text = "💾 บันทึกไฟล์" end)
+end
+btn.MouseButton1Click:Connect(save)
+save()
